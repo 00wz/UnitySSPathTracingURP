@@ -112,6 +112,12 @@ MonoBehaviour:
   noiseMethod:
     m_OverrideState: 0
     m_Value: 0
+  hiZMaxSteps:
+    m_OverrideState: 0
+    m_Value: 32
+  hiZMaxDistance:
+    m_OverrideState: 0
+    m_Value: 50
   denoiser:
     m_OverrideState: 1
     m_Value: 1

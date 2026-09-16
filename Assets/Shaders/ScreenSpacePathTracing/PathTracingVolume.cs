@@ -59,6 +59,18 @@ public class ScreenSpacePathTracing: VolumeComponent, IPostProcessComponent
     public NoiseParameter noiseMethod = new NoiseParameter(NoiseType.HashedRandom, overrideState: false);
 
     /// <summary>
+    /// Defines the maximum number of Hi-Z pyramid traversal steps for primary rays, when Hi-Z Tracing is enabled on the renderer feature.
+    /// </summary>
+    [Header("Hi-Z Tracing"), Tooltip("Defines the maximum number of Hi-Z pyramid traversal steps for primary rays, when Hi-Z Tracing is enabled on the renderer feature. Ray Marching's own \"Maximum Steps\" above no longer applies to these rays.")]
+    public ClampedIntParameter hiZMaxSteps = new ClampedIntParameter(32, 8, 128, overrideState: false);
+
+    /// <summary>
+    /// Defines the maximum world-space distance (in meters) a primary ray is traced via Hi-Z Tracing before falling back to the sky/reflection probe.
+    /// </summary>
+    [Tooltip("Defines the maximum world-space distance (in meters) a primary ray is traced via Hi-Z Tracing before falling back to the sky/reflection probe.")]
+    public ClampedFloatParameter hiZMaxDistance = new ClampedFloatParameter(50f, 1f, 500f, overrideState: false);
+
+    /// <summary>
     /// Specifies the denoiser used for screen space path tracing.
     /// </summary>
     [Header("Accumulation"), Tooltip("Specifies the denoiser used for screen space path tracing. Enter play mode to apply any real-time denoiser.")]

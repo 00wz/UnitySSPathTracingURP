@@ -253,6 +253,291 @@ RayHit RayMarching(Ray ray, half insideObject, half dither, half3 viewDirectionW
     return rayHit;
 }
 
+// === Hi-Z Min-Max Tracing ===========================================
+// Cell-based hierarchical traversal (GPU Pro 5 / Stingray / AMD FidelityFX SSSR style):
+// the ray is advanced through screen-space texel cells using a fully parametric
+// ray/cell-boundary and ray/depth-plane intersection test, not point-sampling. Within a
+// cell the ray's depth changes continuously as it moves in X/Y, so comparing one
+// interpolated depth sample against the cell's stored bounds is not sufficient - what
+// matters is which happens FIRST as the ray advances: leaving the cell's XY footprint,
+// or reaching the cell's nearest-possible-occluder depth plane. Both are solved in
+// closed form (as ray parameter t, in mip0-pixel units) and compared directly.
+//
+// NDC device depth is affine in screen-space distance along a straight 2D screen-space
+// line (the same property that lets rasterizer hardware z-interpolate linearly across a
+// triangle without perspective correction), so the depth-plane crossing has an exact
+// closed-form solution - no iterative refinement needed. Because mip 0's stored bounds
+// ARE the exact per-pixel front/back depth (see HiZDepthPyramid.shader's Init pass), and
+// a hit is only ever accepted once the traversal has descended all the way to mip 0, the
+// returned hit position is already exact to the depth buffer's own texel resolution -
+// there is no fixed-size step grid and no precision gap between samples for a binary
+// search to recover. Only used for primary rays (insideObject == 0); refraction rays
+// keep using RayMarching above, since they rely on its 3-layer depth-stack handling.
+
+bool HiZIsBehindOrAt(float rayDepth, float surfaceDepth)
+{
+#if UNITY_REVERSED_Z
+    return rayDepth <= surfaceDepth;
+#else
+    return rayDepth >= surfaceDepth;
+#endif
+}
+
+// Solves for the ray parameter t (>= currentT) at which the ray's depth first becomes
+// "behind or at" targetDepth (see HiZIsBehindOrAt), or returns a very large sentinel if
+// that never happens for the remainder of the ray.
+//
+// A ray's depth does not necessarily move away from the camera for its whole length - it
+// can curve back toward it (e.g. near-grazing bounces off a steeply angled surface). Once
+// the ray is confirmed NOT behind targetDepth yet, whether it can EVER become behind it
+// later depends on which way its depth is moving relative to the active depth convention:
+//  - moving in the "away" direction (reversed-Z: depth decreasing; otherwise increasing):
+//    the ray is closing in on targetDepth and WILL cross it at the algebraic solution,
+//    which is guaranteed to lie ahead of currentT.
+//  - moving in the "toward camera" direction: the ray is moving further from ever
+//    satisfying HiZIsBehindOrAt against this specific target - it can only have been
+//    behind it in the past (already handled by the "currently behind" check above), never
+//    in the future, so this cell can never register a hit going forward and must be
+//    reported as unreachable (the sentinel), not solved for.
+// Treating both directions with the same closed-form formula silently assumes the first
+// case always holds; for the second case the algebraic solution lands in the past, and
+// naively clamping it forward to currentT turns every step of a toward-camera ray into a
+// false immediate hit - exactly the "reflections cut off at grazing angles" bug this
+// function exists to avoid.
+float HiZSolveDepthCrossing(float currentT, float currentDepth, float targetDepth,
+                             float startDepth, float deltaDepth, float invDeltaDepth, float distPx)
+{
+    if (HiZIsBehindOrAt(currentDepth, targetDepth))
+        return currentT;
+
+    if (abs(deltaDepth) <= 1e-8)
+        return 1e8; // Depth does not change along the ray - it will never reach a different value.
+
+#if UNITY_REVERSED_Z
+    bool approachingTarget = deltaDepth < 0.0;
+#else
+    bool approachingTarget = deltaDepth > 0.0;
+#endif
+    if (!approachingTarget)
+        return 1e8;
+
+    return max((targetDepth - startDepth) * invDeltaDepth * distPx, currentT);
+}
+
+// Complementary to HiZSolveDepthCrossing: given the ray is CURRENTLY behind targetDepth,
+// solves for the t (>= currentT) at which it will surface back out of that state, or
+// returns a large sentinel if it stays behind for the rest of the ray. A ray moving away
+// from the camera that is already behind a given depth stays behind it forever
+// (monotonically decreasing depth never comes back) - only a ray curving back toward the
+// camera can surface out again, which is exactly the direction HiZSolveDepthCrossing
+// treats as "never enters". Without this, a coarse cell's "past everything" state (see
+// HiZClassifyOcclusion) would be assumed to persist until the ray leaves the cell in XY,
+// silently skipping over the point where a toward-camera ray re-emerges mid-cell.
+float HiZSolveDepthExit(float currentT, float startDepth, float targetDepth,
+                         float deltaDepth, float invDeltaDepth, float distPx)
+{
+    if (abs(deltaDepth) <= 1e-8)
+        return 1e8; // Depth never changes - if already behind, stays behind forever.
+
+#if UNITY_REVERSED_Z
+    bool recedingFromTarget = deltaDepth > 0.0;
+#else
+    bool recedingFromTarget = deltaDepth < 0.0;
+#endif
+    if (!recedingFromTarget)
+        return 1e8;
+
+    return max((targetDepth - startDepth) * invDeltaDepth * distPx, currentT);
+}
+
+// Occlusion classification for a Hi-Z cell, using the pyramid's real per-pixel front/back
+// depth bounds (see SampleHiZLevel) instead of an assumed thickness: minMax.y is the
+// nearest possible entry surface in the cell, minMax.x is the farthest possible exit
+// surface. Both are exact worst-case bounds for the whole cell (never an approximation),
+// so once the ray is behind minMax.x it is guaranteed to have cleared every occluder the
+// cell could contain - no uncertainty remains that would require rejecting a later hit as
+// unreliable.
+//
+// Returns true when the ray's current depth lies between the two bounds - real opaque
+// geometry may occupy this depth range, so the caller either descends the hierarchy to
+// confirm or, at mip 0 (exact per-pixel data), accepts it as a hit outright. Returns
+// false otherwise, with outEventT receiving the future t (>= currentT) at which the ray
+// would next cross into that range - via HiZSolveDepthCrossing if still in front of
+// minMax.y, or via HiZSolveDepthExit if already behind minMax.x and only reachable again
+// by curving back toward the camera - or a large sentinel if that never happens for the
+// remainder of the ray.
+bool HiZClassifyOcclusion(float currentT, float currentDepth, float2 minMax,
+                           float startDepth, float deltaDepth, float invDeltaDepth, float distPx,
+                           out float outEventT)
+{
+    if (!HiZIsBehindOrAt(currentDepth, minMax.y))
+    {
+        outEventT = HiZSolveDepthCrossing(currentT, currentDepth, minMax.y, startDepth, deltaDepth, invDeltaDepth, distPx);
+        return false;
+    }
+
+    if (HiZIsBehindOrAt(currentDepth, minMax.x))
+    {
+        outEventT = HiZSolveDepthExit(currentT, startDepth, minMax.x, deltaDepth, invDeltaDepth, distPx);
+        return false;
+    }
+
+    outEventT = currentT;
+    return true;
+}
+
+// Clamps the world-space marching distance so ray.position + ray.direction * distance
+// never crosses (or gets numerically close to) the camera's near plane. Projecting to NDC
+// via a perspective divide is only well-behaved in front of the camera: as a point
+// approaches the near plane, w -> 0 and its projected screen position/depth blow up
+// toward infinity, then flip sign once actually behind it. Rays routinely curve back
+// toward the camera at grazing angles (viewDirVS.z > 0), so this is a real, reachable
+// case - the ray must be clipped the same way a rasterizer clips triangles against the
+// near plane before the perspective divide, rather than trusting the raw max-distance
+// endpoint to always be safely projectable.
+float HiZClipDistanceToNearPlane(float3 originVS, float3 dirVS, float maxDistance)
+{
+    if (unity_OrthoParams.w > 0.5 || dirVS.z <= 0.0)
+        return maxDistance; // Orthographic has no perspective singularity; moving away
+                             // from the camera never approaches the near plane.
+
+    // Small safety margin so w stays comfortably away from zero, not just non-negative.
+    float nearZ = -_ProjectionParams.y * 1.05;
+    float distToNearPlane = (nearZ - originVS.z) / dirVS.z;
+    return clamp(distToNearPlane, 0.0, maxDistance);
+}
+
+// World-space Hi-Z traversal for primary rays. Ray/RayHit-compatible with RayMarching
+// above. There is no fixed step grid to dither - every hit is an exact closed-form
+// crossing point.
+RayHit HiZTracing(Ray ray)
+{
+    RayHit rayHit = InitializeRayHit();
+
+    float3 originVS = TransformWorldToView(ray.position);
+    float3 dirVS = TransformWorldToViewDir(ray.direction, true);
+    float clippedDistance = HiZClipDistanceToNearPlane(originVS, dirVS, _HiZMaxDistance);
+
+    float3 startSS = ComputeNormalizedDeviceCoordinatesWithZ(ray.position, GetWorldToHClipMatrix());
+    float3 endSS = ComputeNormalizedDeviceCoordinatesWithZ(ray.position + ray.direction * clippedDistance, GetWorldToHClipMatrix());
+#if (UNITY_REVERSED_Z == 0) // OpenGL platforms: match RayMarching's own -1..1 -> 0..1 remap.
+    startSS.z = startSS.z * 0.5 + 0.5;
+    endSS.z = endSS.z * 0.5 + 0.5;
+#endif
+
+    float2 realSize = _HiZScreenSize.xy;
+    float2 startPx = startSS.xy * realSize;
+    float2 endPx = endSS.xy * realSize;
+
+    float2 deltaPx = endPx - startPx;
+    float distPx = length(deltaPx);
+    if (distPx < 1.0)
+        return rayHit;
+
+    float2 dir = deltaPx / distPx;
+    // Cell-boundary math divides by direction components - keep them safely non-zero.
+    float2 safeDir = float2(
+        abs(dir.x) < 1e-5 ? (dir.x < 0.0 ? -1e-5 : 1e-5) : dir.x,
+        abs(dir.y) < 1e-5 ? (dir.y < 0.0 ? -1e-5 : 1e-5) : dir.y);
+
+    float deltaDepth = endSS.z - startSS.z;
+    bool depthVaries = abs(deltaDepth) > 1e-8;
+    float invDeltaDepth = depthVaries ? (1.0 / deltaDepth) : 0.0;
+
+    // A fixed small starting offset (in pixels) is enough to avoid self-intersection with
+    // the reflecting surface itself. HiZTracing does not sample at discrete fixed-size
+    // steps - every hit is an exact closed-form crossing point, so there is no fixed step
+    // grid for per-pixel jitter to dither/de-band.
+    float t = 1.0;
+
+    int maxLevel = max((int)_HiZLevelCount - 1, 0);
+    int level = 0;
+    int iterCount = min((int)_HiZMaxSteps, HIZ_MAX_ITER);
+
+    UNITY_LOOP
+    for (int i = 0; i < HIZ_MAX_ITER; i++)
+    {
+        if (i >= iterCount || t >= distPx)
+            break;
+
+        float2 pos = startPx + dir * t;
+        if (pos.x < 0.0 || pos.x >= realSize.x || pos.y < 0.0 || pos.y >= realSize.y)
+            return rayHit; // Clean miss: ray left the visible screen.
+
+        // UV is resolution-independent, so it must always be normalized against the BASE
+        // (level 0) padded canvas size, never the current level's own (smaller) size -
+        // _HiZMipInfo[level] only describes that level's texel count, not a valid UV
+        // denominator for a "pos" given in base-resolution pixel units.
+        float2 uvPyramid = pos / _HiZMipInfo[0].xy;
+        float2 minMax = SampleHiZLevel(uvPyramid, level);
+
+        float currentDepth = lerp(startSS.z, endSS.z, saturate(t / distPx));
+        float tEvent;
+        bool isCandidate = HiZClassifyOcclusion(t, currentDepth, minMax, startSS.z,
+                                                 deltaDepth, invDeltaDepth, distPx, tEvent);
+
+        // t at which the ray leaves the current cell's XY footprint.
+        float cellSize = (float)(1u << level);
+        float2 cellIndex = floor(pos / cellSize);
+        float2 boundary = (cellIndex + step(0.0, safeDir)) * cellSize;
+        float2 tAxis = (boundary - startPx) / safeDir;
+        float tCell = max(min(tAxis.x, tAxis.y), t);
+
+        if (isCandidate)
+        {
+            // Between the cell's real front/back depth bounds - opaque geometry may
+            // occupy this range.
+            if (level == 0)
+            {
+                // Mip 0 stores exact per-pixel front/back depth (no cell aggregation left
+                // to be uncertain about) - the ray is genuinely between this pixel's own
+                // front and back surface, i.e. inside solid opaque geometry. Always an
+                // outright hit.
+                float2 hitUV = pos / realSize;
+                float hitDepth = currentDepth;
+            #if (UNITY_REVERSED_Z == 0)
+                // Inverse of the forward GL remap above, matching ScreenSpacePathTracing.shader's frag().
+                hitDepth = lerp(UNITY_NEAR_CLIP_VALUE, 1.0, hitDepth);
+            #endif
+                float3 hitPositionWS = ComputeWorldSpacePosition(hitUV, hitDepth, UNITY_MATRIX_I_VP);
+
+                rayHit.position = hitPositionWS;
+                rayHit.distance = distance(hitPositionWS, ray.position);
+                rayHit.insideObject = 0.0;
+
+                HitSurfaceDataFromGBuffer(hitUV, rayHit);
+
+                // Add position offset to avoid self-intersection, we don't know the next ray direction yet.
+                rayHit.position += rayHit.normal * RAY_BIAS;
+
+                return rayHit;
+            }
+
+            level--;
+        }
+        else
+        {
+            // Clearly outside the cell's occupied depth range (either not reached yet, or
+            // already past every occluder the cell could contain) - skip ahead to the
+            // next event using the same tEvent/tCell logic either way.
+            if (tEvent < tCell)
+            {
+                // Will enter the occlusion window before leaving this cell - jump straight
+                // to it and re-classify there next iteration.
+                t = tEvent + 0.05;
+            }
+            else
+            {
+                // Clear for the remainder of this cell - climb the hierarchy.
+                t = tCell + 0.05;
+                level = min(level + 1, maxLevel);
+            }
+        }
+    }
+
+    return rayHit; // Miss: search budget exhausted.
+}
+
 half3 EvaluateBRDF(inout Ray ray, RayHit rayHit, float3 positionWS, float2 screenUV)
 {
     // If the ray intersects the scene.
@@ -462,7 +747,14 @@ void ScreenSpacePathTracing(float depth, float3 positionWS, float3 cameraPositio
         {
             half sceneDistance = rayHit.distance * 0.1;
             depth = LinearEyeDepth(depth, _ZBufferParams);
+        #if defined(_HIZ_TRACING)
+            if (rayHit.insideObject == 0.0)
+                rayHit = HiZTracing(ray);
+            else
+                rayHit = RayMarching(ray, rayHit.insideObject, dither, viewDirectionWS, depth);
+        #else
             rayHit = RayMarching(ray, rayHit.insideObject, dither, viewDirectionWS, depth);
+        #endif
 
             // Firefly reduction
             // From https://twitter.com/YuriyODonnell/status/1199253959086612480

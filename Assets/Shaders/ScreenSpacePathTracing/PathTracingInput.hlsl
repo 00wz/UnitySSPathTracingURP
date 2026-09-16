@@ -44,6 +44,8 @@ TEXTURE2D_X_HALF(_CameraBackNormalsTexture);
 
 SAMPLER(my_point_clamp_sampler);
 
+#include "./HiZCommon.hlsl"
+
 #if _RENDER_PASS_ENABLED
 
 #define GBUFFER0 0

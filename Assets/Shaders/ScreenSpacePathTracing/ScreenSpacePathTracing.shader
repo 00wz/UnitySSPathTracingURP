@@ -49,6 +49,7 @@ Shader "Hidden/Universal Render Pipeline/Screen Space Path Tracing"
             #pragma multi_compile_local_fragment _ _FP_REFL_PROBE_ATLAS
             #pragma multi_compile_local_fragment _ _SUPPORT_REFRACTION
             #pragma multi_compile_local_fragment _ _BACKFACE_TEXTURES
+            #pragma multi_compile_local_fragment _ _HIZ_TRACING
 
             #pragma shader_feature_local_fragment _ _IGNORE_FORWARD_OBJECTS
 

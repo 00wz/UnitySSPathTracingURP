@@ -6,6 +6,7 @@ using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
 using UnityEngine.Rendering.RendererUtils;
 using UnityEngine.Experimental.Rendering;
+using UnityEngine.XR;
 
 #if UNITY_6000_0_OR_NEWER
 using UnityEngine.Rendering.RenderGraphModule;
@@ -70,6 +71,19 @@ public class ScreenSpacePathTracingAccumulation : ScriptableRendererFeature
     [Header("Path Tracing Extensions")]
     [Tooltip("Render the backface depth of scene geometries. This improves the accuracy of screen space path tracing, but may not work well in scenes with lots of single-sided objects.")]
     [SerializeField] private AccurateThickness accurateThickness = AccurateThickness.DepthOnly;
+
+    [Header("Hi-Z Tracing")]
+    [Tooltip("Use a Hi-Z depth-pyramid tracer instead of naive ray marching for primary (opaque) rays. Refraction rays are unaffected and always use ray marching.")]
+    [SerializeField] private bool enableHiZTracing = true;
+
+    [Tooltip("The material of the Hi-Z depth pyramid shader.")]
+    [SerializeField] private Material m_HiZMaterial;
+
+    [Tooltip("Maximum number of Hi-Z pyramid mip levels to build. Higher values allow the tracer to skip over larger empty regions at the cost of pyramid build time.")]
+    [SerializeField] private int hiZMaxMipLevel = 8;
+
+    [Tooltip("Resolution scale at which the Hi-Z pyramid is built, relative to the camera target.")]
+    [SerializeField] private float hiZPyramidResolutionScale = 1.0f;
 
     [Header("Additional Lighting Models")]
     [Tooltip("Specifies if the effect calculates path tracing refractions.")]
@@ -178,10 +192,12 @@ public class ScreenSpacePathTracingAccumulation : ScriptableRendererFeature
     }
 
     private const string m_PathTracingShaderName = "Hidden/Universal Render Pipeline/Screen Space Path Tracing";
+    private const string m_HiZShaderName = "Hidden/Universal Render Pipeline/HiZ Depth Pyramid";
     private readonly string[] m_GBufferPassNames = new string[] { "UniversalGBuffer" };
     private PathTracingPass m_PathTracingPass;
     private AccumulationPass m_AccumulationPass;
     private BackfaceDepthPass m_BackfaceDepthPass;
+    private HiZPyramidPass m_HiZPyramidPass;
     private TransparentGBufferPass m_TransparentGBufferPass;
     private ForwardGBufferPass m_ForwardGBufferPass;
     private readonly static FieldInfo renderingModeFieldInfo = typeof(UniversalRenderer).GetField("m_RenderingMode", BindingFlags.NonPublic | BindingFlags.Instance);
@@ -285,6 +301,24 @@ public class ScreenSpacePathTracingAccumulation : ScriptableRendererFeature
 
         m_BackfaceDepthPass.m_AccurateThickness = refraction ? AccurateThickness.DepthNormals : accurateThickness;
 
+        if (m_HiZMaterial != null && m_HiZMaterial.shader == Shader.Find(m_HiZShaderName))
+        {
+            if (m_HiZPyramidPass == null)
+            {
+                m_HiZPyramidPass = new HiZPyramidPass();
+                m_HiZPyramidPass.renderPassEvent = RenderPassEvent.AfterRenderingOpaques - 1;
+            }
+            m_HiZPyramidPass.m_HiZMaterial = m_HiZMaterial;
+        }
+        else
+        {
+            if (m_HiZPyramidPass != null)
+            {
+                m_HiZPyramidPass.Dispose();
+                m_HiZPyramidPass = null;
+            }
+        }
+
         if (m_TransparentGBufferPass == null)
         {
             m_TransparentGBufferPass = new TransparentGBufferPass(m_GBufferPassNames);
@@ -316,6 +350,11 @@ public class ScreenSpacePathTracingAccumulation : ScriptableRendererFeature
             m_TransparentGBufferPass.Dispose();
         if (m_ForwardGBufferPass! != null)
             m_ForwardGBufferPass.Dispose();
+        if (m_HiZPyramidPass != null)
+        {
+            m_PathTracingMaterial.DisableKeyword("_HIZ_TRACING");
+            m_HiZPyramidPass.Dispose();
+        }
     }
 
     void StoreAmbientSettings(ScreenSpacePathTracing ssptVolume)
@@ -490,6 +529,27 @@ public class ScreenSpacePathTracingAccumulation : ScriptableRendererFeature
         {
             m_PathTracingMaterial.DisableKeyword("_BACKFACE_TEXTURES");
             m_PathTracingMaterial.SetFloat(_BackDepthEnabled, 0.0f);
+        }
+
+        // Single-pass-instanced XR is not supported by the Hi-Z pyramid in v1 (its mip
+        // textures are not XR-texture-array aware) - fall back to ray marching there.
+        bool xrSinglePassInstanced = XRSettings.enabled && XRSettings.stereoRenderingMode == XRSettings.StereoRenderingMode.SinglePassInstanced;
+        bool useHiZ = enableHiZTracing && m_HiZPyramidPass != null && !xrSinglePassInstanced;
+
+        if (useHiZ)
+        {
+            m_HiZPyramidPass.hasBackfaceDepth = m_BackfaceDepthPass.m_AccurateThickness != AccurateThickness.None;
+            m_HiZPyramidPass.maxMipLevel = hiZMaxMipLevel;
+            m_HiZPyramidPass.pyramidResolutionScale = hiZPyramidResolutionScale;
+            m_HiZPyramidPass.maxSteps = ssptVolume.hiZMaxSteps.value;
+            m_HiZPyramidPass.maxDistance = ssptVolume.hiZMaxDistance.value;
+
+            renderer.EnqueuePass(m_HiZPyramidPass);
+            m_PathTracingMaterial.EnableKeyword("_HIZ_TRACING");
+        }
+        else
+        {
+            m_PathTracingMaterial.DisableKeyword("_HIZ_TRACING");
         }
 
         if (refraction)
