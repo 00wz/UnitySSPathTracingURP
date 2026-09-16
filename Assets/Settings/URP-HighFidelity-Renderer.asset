@@ -15,7 +15,11 @@ MonoBehaviour:
   m_Active: 1
   m_PathTracingMaterial: {fileID: 2100000, guid: a67291bbecb6c2649ba10a01f0af3ccc,
     type: 2}
-  accurateThickness: 1
+  accurateThickness: 0
+  enableHiZTracing: 1
+  m_HiZMaterial: {fileID: 2100000, guid: 30d8b35f9ce9bbc4d89899a92865b011, type: 2}
+  hiZMaxMipLevel: 8
+  hiZPyramidResolutionScale: 1
   refraction: 1
   progressBar: 1
   spatialDenoise: 1

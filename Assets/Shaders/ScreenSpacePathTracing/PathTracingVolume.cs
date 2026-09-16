@@ -38,7 +38,7 @@ public class ScreenSpacePathTracing: VolumeComponent, IPostProcessComponent
     /// Defines the number of paths cast within each pixel per frame.
     /// </summary>
     [Tooltip("Defines the number of paths cast within each pixel per frame.")]
-    public ClampedIntParameter samplesPerPixel = new ClampedIntParameter(1, 1, 16, overrideState: false);
+    public ClampedIntParameter samplesPerPixel = new ClampedIntParameter(1, 1, 300, overrideState: false);
 
     /// <summary>
     /// Defines the maximum number of steps a path can take during one bounce, affecting the precision and performance of path tracing.

@@ -14,6 +14,7 @@ Material:
   m_ValidKeywords:
   - _BACKFACE_TEXTURES
   - _FP_REFL_PROBE_ATLAS
+  - _HIZ_TRACING
   - _METHOD_HASHED_RANDOM
   - _SUPPORT_REFRACTION
   m_InvalidKeywords:
@@ -141,15 +142,15 @@ Material:
     - _MaxBounce: 4
     - _MaxBrightness: 10
     - _MaxSample: 512
-    - _MaxSteps: 32
+    - _MaxSteps: 64
     - _Metallic: 0
     - _OcclusionStrength: 1
     - _Parallax: 0.005
     - _QueueOffset: 0
     - _RAY_MARCHING: 1
-    - _RayCount: 1
+    - _RayCount: 16
     - _ReceiveShadows: 1
-    - _Sample: 0
+    - _Sample: 60
     - _Seed: 0
     - _Smoothness: 0.5
     - _SmoothnessTextureChannel: 0

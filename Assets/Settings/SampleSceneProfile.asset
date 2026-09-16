@@ -102,10 +102,10 @@ MonoBehaviour:
     m_Value: 10
   samplesPerPixel:
     m_OverrideState: 1
-    m_Value: 1
+    m_Value: 16
   maximumSteps:
     m_OverrideState: 1
-    m_Value: 32
+    m_Value: 64
   stepSize:
     m_OverrideState: 0
     m_Value: 0.4
@@ -113,11 +113,11 @@ MonoBehaviour:
     m_OverrideState: 0
     m_Value: 0
   hiZMaxSteps:
-    m_OverrideState: 0
-    m_Value: 32
+    m_OverrideState: 1
+    m_Value: 64
   hiZMaxDistance:
-    m_OverrideState: 0
-    m_Value: 50
+    m_OverrideState: 1
+    m_Value: 500
   denoiser:
     m_OverrideState: 1
     m_Value: 1
