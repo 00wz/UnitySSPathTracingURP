@@ -308,7 +308,7 @@ half3 EvaluateBRDF(inout Ray ray, RayHit rayHit, float3 positionWS, float2 scree
             else if (rayHit.insideObject == 1.0) // apply the tint here if the ray needs to fall back to reflection probe
                 ray.energy *= rcp(max(refractProbability, 0.001)) * rayHit.albedo;
         }
-        else if (specProbability > 0.0 && roulette < specProbability)
+        else if (specProbability > 0.0 && roulette < refractProbability + specProbability)
         {
             // Note: H is the microfacet normal direction
 
@@ -330,8 +330,11 @@ half3 EvaluateBRDF(inout Ray ray, RayHit rayHit, float3 positionWS, float2 scree
             // Fresnel component is apply here as describe in ImportanceSampleGGX function
             ray.energy *= rcp(specProbability) * brdf * weightOverPdf;
         }
-        else if (diffProbability > 0.0 && roulette < diffProbability)
+        else if (diffProbability > 0.0)
         {
+            // Reaching this branch already implies roulette >= refractProbability + specProbability,
+            // and since refractProbability + specProbability + diffProbability == 1, diffuse is the
+            // only remaining outcome - no need (and no correct way) to re-test roulette against diffProbability.
             half3 L;
             half NdotL;
             half weightOverPdf;
